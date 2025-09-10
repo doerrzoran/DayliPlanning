@@ -1,0 +1,113 @@
+# .github/workflows/deploy.yml
+name: Deploy to Production
+
+on:
+  push:
+    branches: [ dev ]
+  workflow_run:
+    workflows: ["CI/CD Pipeline"]
+    types:
+      - completed
+    branches: [ dev ]
+
+jobs:
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'push' }}
+    
+    environment: production
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile.prod
+          push: true
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/app-backend:latest
+            ${{ secrets.DOCKER_USERNAME }}/app-backend:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile.prod
+          push: true
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/app-frontend:latest
+            ${{ secrets.DOCKER_USERNAME }}/app-frontend:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Deploy to server
+        uses: appleboy/ssh-action@v0.1.7
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd /path/to/your/app
+            
+            # Update docker-compose.yml with new image tags
+            sed -i 's/app-backend:latest/app-backend:${{ github.sha }}/g' docker-compose.prod.yml
+            sed -i 's/app-frontend:latest/app-frontend:${{ github.sha }}/g' docker-compose.prod.yml
+            
+            # Pull new images
+            docker-compose -f docker-compose.prod.yml pull
+            
+            # Backup database
+            docker-compose -f docker-compose.prod.yml exec -T postgres pg_dump -U $POSTGRES_USER $POSTGRES_DB > backup_$(date +%Y%m%d_%H%M%S).sql
+            
+            # Run database migrations
+            docker-compose -f docker-compose.prod.yml run --rm backend php bin/console doctrine:migrations:migrate --no-interaction
+            
+            # Restart services with zero downtime
+            docker-compose -f docker-compose.prod.yml up -d --no-deps backend
+            docker-compose -f docker-compose.prod.yml up -d --no-deps frontend
+            
+            # Clean up old images
+            docker image prune -a -f --filter "until=24h"
+
+      - name: Run smoke tests
+        run: |
+          sleep 30
+          curl -f ${{ secrets.PRODUCTION_URL }}/health
+          curl -f ${{ secrets.PRODUCTION_URL }}
+
+      - name: Notify deployment
+        if: success()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: success
+          text: "✅ Deployment successful to production"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+      - name: Rollback on failure
+        if: failure()
+        uses: appleboy/ssh-action@v0.1.7
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd /path/to/your/app
+            docker-compose -f docker-compose.prod.yml down
+            git checkout HEAD~1 docker-compose.prod.yml
+            docker-compose -f docker-compose.prod.yml up -d
