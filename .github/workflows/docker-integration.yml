@@ -1,0 +1,125 @@
+# .github/workflows/docker-integration.yml
+name: Docker Integration Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  docker-integration:
+    name: Docker Integration Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create docker network
+        run: docker network create app-network
+
+      - name: Start PostgreSQL container
+        run: |
+          docker run -d \
+            --name postgres-test \
+            --network app-network \
+            -e POSTGRES_DB=test_db \
+            -e POSTGRES_USER=test_user \
+            -e POSTGRES_PASSWORD=test_password \
+            -p 5432:5432 \
+            postgres:15
+
+      - name: Wait for PostgreSQL to be ready
+        run: |
+          until docker exec postgres-test pg_isready -U test_user -d test_db; do
+            echo "Waiting for PostgreSQL..."
+            sleep 2
+          done
+
+      - name: Build backend Docker image
+        run: |
+          docker build -t backend:test -f backend/Dockerfile backend/
+
+      - name: Run backend container
+        run: |
+          docker run -d \
+            --name backend-test \
+            --network app-network \
+            -e DATABASE_URL="postgresql://${{ env.POSTGRES_USER }}:${{ env.POSTGRES_PASSWORD }}@postgres-test:5432/${{ env.POSTGRES_DB }}" \
+            -e APP_ENV=test \
+            -p 8000:8000 \
+            backend:test
+
+      - name: Wait for backend to be ready
+        run: |
+          until curl -f http://localhost:8000/health; do
+            echo "Waiting for backend..."
+            sleep 5
+          done
+
+      - name: Run database migrations
+        run: |
+          docker exec backend-test php bin/console doctrine:migrations:migrate --no-interaction --env=test
+
+      - name: Load fixtures
+        run: |
+          docker exec backend-test php bin/console doctrine:fixtures:load --no-interaction --env=test
+
+      - name: Build frontend Docker image
+        run: |
+          docker build -t frontend:test -f frontend/Dockerfile frontend/
+
+      - name: Run frontend container
+        run: |
+          docker run -d \
+            --name frontend-test \
+            --network app-network \
+            -e REACT_APP_API_URL=http://backend-test:8000 \
+            -p 3000:3000 \
+            frontend:test
+
+      - name: Wait for frontend to be ready
+        run: |
+          until curl -f http://localhost:3000; do
+            echo "Waiting for frontend..."
+            sleep 5
+          done
+
+      - name: Run integration tests
+        run: |
+          # Test API endpoints
+          curl -f http://localhost:8000/api/health
+          
+          # Test frontend
+          curl -f http://localhost:3000
+          
+          # Run container-specific tests
+          docker exec backend-test php bin/phpunit --group=integration
+          
+      - name: Run API tests with Newman
+        run: |
+          npx newman run tests/postman/api-tests.json \
+            --environment tests/postman/test-env.json \
+            --reporters cli,json \
+            --reporter-json-export test-results.json
+
+      - name: Check logs
+        if: failure()
+        run: |
+          echo "Backend logs:"
+          docker logs backend-test
+          echo "Frontend logs:"
+          docker logs frontend-test
+          echo "Database logs:"
+          docker logs postgres-test
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop backend-test frontend-test postgres-test || true
+          docker rm backend-test frontend-test postgres-test || true
+          docker network rm app-network || true
