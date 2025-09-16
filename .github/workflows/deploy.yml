@@ -62,7 +62,7 @@ jobs:
           username: ${{ secrets.USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            cd /path/to/your/app
+            cd /apps/DayliPlanning
             
             # Update docker-compose.yml with new image tags
             sed -i 's/app-backend:latest/app-backend:${{ github.sha }}/g' docker-compose.prod.yml
